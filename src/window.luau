@@ -27,8 +27,8 @@ type Config = {
 
 local TICK_MS = 250
 local CONFIG_EVERY_TICKS = 20 -- re-read sounds.toml about every 5 s
-local MIN_GAP_MS = 500 -- chimes never overlap
-local CLAIM_WINDOW_S = 2 -- cross-window dedup: one chime per moment
+local MIN_GAP_MS = 500 -- same-window debounce for back-to-back events
+local CLAIM_WINDOW_MS = 2000 -- cross-window dedup: one chime per moment
 
 local SEP = if tern.runtime.os == "windows" then "\\" else "/"
 local DATA_SEP = tern.plugin.data .. SEP
@@ -230,18 +230,19 @@ end
 
 -- One chime per moment across windows: whoever claims it plays it.
 local function claim_chime(): boolean
-	local now_s = os.time()
+	local now_ms = tern.now()
 	local ok, at = pcall(tern.kv.get, "last_chime")
-	if ok and type(at) == "number" and now_s - (at :: number) < CLAIM_WINDOW_S then
+	-- `at <= now_ms` ignores a stale value written by an older build (seconds, not ms).
+	if ok and type(at) == "number" and at <= now_ms and now_ms - (at :: number) < CLAIM_WINDOW_MS then
 		return false
 	end
-	pcall(tern.kv.set, "last_chime", now_s)
+	pcall(tern.kv.set, "last_chime", now_ms)
 	return true
 end
 
 -- Playback ----------------------------------------------------------------------------------
 
-local function spawn(argv: { string }, path: string)
+local function spawn(argv: { string }, path: string, on_done: (() -> ())?)
 	local ok, err = pcall(function()
 		tern.process.run(argv, { timeout_ms = 15000 }, function(result: ProcessResult)
 			if result.timed_out then
@@ -250,17 +251,35 @@ local function spawn(argv: { string }, path: string)
 				local detail = if result.stderr ~= "" then result.stderr else "exit " .. tostring(result.status)
 				tern.log.warn("Chime: couldn't play " .. path .. ": " .. trim(detail))
 			end
+			if on_done then
+				on_done()
+			end
 		end)
 	end)
 	if not ok then
 		tern.log.warn("Chime: couldn't start the player: " .. tostring(err))
+		if on_done then
+			on_done()
+		end
 	end
 end
 
 local linux_player: string? = nil
 local linux_probe_failed = false
 local linux_probing = false
-local linux_queue: { string } = {}
+local linux_queue: { { path: string, on_done: (() -> ())? } } = {}
+
+-- A chime waiting on a player that never arrives must still release the
+-- queue: pump() waits for on_done before the next sound may play.
+local function release_linux_queue()
+	local pending = linux_queue
+	linux_queue = {}
+	for _, entry in pending do
+		if entry.on_done then
+			entry.on_done()
+		end
+	end
+end
 
 -- Preference order: PipeWire-native first (pw-play ships with pipewire),
 -- then PulseAudio, ALSA, then the heavy/general players.
@@ -297,52 +316,96 @@ local function probe_linux_player()
 				local name = string.match(result.stdout, "([%w-]+)")
 				if result.status == 0 and name ~= nil and name ~= "" then
 					linux_player = name
-					for _, path in linux_queue do
-						spawn(linux_argv(name, path), path)
+					local pending = linux_queue
+					linux_queue = {}
+					for _, entry in pending do
+						spawn(linux_argv(name, entry.path), entry.path, entry.on_done)
 					end
 				else
 					linux_probe_failed = true
 					tern.log.warn("Chime: no sound player found (need one of: " .. names .. ")")
+					release_linux_queue()
 				end
-				linux_queue = {}
 			end
 		)
 	end)
 	if not ok then
 		linux_probing = false
 		linux_probe_failed = true
-		linux_queue = {}
 		tern.log.warn("Chime: couldn't probe for a sound player: " .. tostring(err))
+		release_linux_queue()
 	end
 end
 
 local warned_no_player = false
 
-local function play_file(path: string)
+local function play_file(path: string, on_done: (() -> ())?)
 	local os_name = tern.runtime.os
 	if os_name == "ios" then
-		return
+		if on_done then
+			on_done()
+		end
 	elseif os_name == "windows" then
 		-- Via wscript (a windowless GUI host): spawning hidden PowerShell
 		-- directly still flashes a console box on creation. SoundPlayer
 		-- takes WAV only.
-		spawn({ "wscript.exe", "//Nologo", tern.plugin.dir .. SEP .. "scripts" .. SEP .. "play.vbs", path }, path)
+		spawn({ "wscript.exe", "//Nologo", tern.plugin.dir .. SEP .. "scripts" .. SEP .. "play.vbs", path }, path, on_done)
 	elseif os_name == "macos" then
-		spawn({ "afplay", path }, path)
+		spawn({ "afplay", path }, path, on_done)
 	elseif os_name == "linux" then
 		local player = linux_player
 		if player ~= nil then
-			spawn(linux_argv(player, path), path)
+			spawn(linux_argv(player, path), path, on_done)
 		elseif not linux_probe_failed then
-			table.insert(linux_queue, path)
+			table.insert(linux_queue, { path = path, on_done = on_done })
 			probe_linux_player()
 		elseif not warned_no_player then
 			warned_no_player = true
 			tern.log.warn("Chime: silent (no Linux player; install pipewire-pulse, alsa-utils, sox or ffmpeg)")
+			if on_done then
+				on_done()
+			end
+		else
+			if on_done then
+				on_done()
+			end
 		end
 	else
 		tern.log.warn("Chime: no player for " .. os_name)
+		if on_done then
+			on_done()
+		end
 	end
+end
+
+-- One sound at a time: two chimes never mix into one distorted burst.
+-- `wait` queues a sound even while another plays (the palette's test sound
+-- must always be heard); a normal chime is dropped while one is sounding,
+-- which is what "Chimes never overlap" promises.
+local queue: { string } = {}
+local playing = false
+
+local function pump()
+	if playing then
+		return
+	end
+	local path = table.remove(queue, 1)
+	if path == nil then
+		return
+	end
+	playing = true
+	play_file(path, function()
+		playing = false
+		pump()
+	end)
+end
+
+local function enqueue(path: string, wait: boolean)
+	if not wait and (playing or #queue > 0) then
+		return
+	end
+	table.insert(queue, path)
+	pump()
 end
 
 local last_chime_at = -math.huge
@@ -368,7 +431,7 @@ local function chime(kind: string, _pane: number)
 		return
 	end
 	last_chime_at = now
-	play_file(path)
+	enqueue(path, false)
 end
 
 -- Triggers ----------------------------------------------------------------------------------
@@ -493,7 +556,7 @@ tern.command({
 			cx:toast("error", "Chime", "Missing: " .. path)
 			return
 		end
-		play_file(path)
+		enqueue(path, true)
 		cx:toast("info", "Chime", "Playing " .. path)
 	end,
 })
