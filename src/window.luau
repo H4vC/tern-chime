@@ -269,6 +269,18 @@ local linux_probe_failed = false
 local linux_probing = false
 local linux_queue: { { path: string, on_done: (() -> ())? } } = {}
 
+-- A chime waiting on a player that never arrives must still release the
+-- queue: pump() waits for on_done before the next sound may play.
+local function release_linux_queue()
+	local pending = linux_queue
+	linux_queue = {}
+	for _, entry in pending do
+		if entry.on_done then
+			entry.on_done()
+		end
+	end
+end
+
 -- Preference order: PipeWire-native first (pw-play ships with pipewire),
 -- then PulseAudio, ALSA, then the heavy/general players.
 local LINUX_PLAYERS = { "pw-play", "paplay", "aplay", "ffplay", "play" }
@@ -304,22 +316,24 @@ local function probe_linux_player()
 				local name = string.match(result.stdout, "([%w-]+)")
 				if result.status == 0 and name ~= nil and name ~= "" then
 					linux_player = name
-					for _, entry in linux_queue do
+					local pending = linux_queue
+					linux_queue = {}
+					for _, entry in pending do
 						spawn(linux_argv(name, entry.path), entry.path, entry.on_done)
 					end
 				else
 					linux_probe_failed = true
 					tern.log.warn("Chime: no sound player found (need one of: " .. names .. ")")
+					release_linux_queue()
 				end
-				linux_queue = {}
 			end
 		)
 	end)
 	if not ok then
 		linux_probing = false
 		linux_probe_failed = true
-		linux_queue = {}
 		tern.log.warn("Chime: couldn't probe for a sound player: " .. tostring(err))
+		release_linux_queue()
 	end
 end
 
