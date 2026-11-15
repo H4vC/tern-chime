@@ -228,6 +228,62 @@ local function maybe_reload_config()
 	end
 end
 
+local function quote(s: string): string
+	return "'" .. (string.gsub(s, "'", "\\'")) .. "'"
+end
+
+-- Louder and Softer write `volume` into <plugin data>/sounds.toml, the file
+-- that wins, so the config stays the one place it lives. An existing file
+-- keeps every other line; without one, the settings in use are written out
+-- with absolute paths, so only the volume changes.
+local function save_volume(volume: number)
+	local line = "volume = " .. tostring(volume)
+	local ok, text = pcall(tern.fs.read, DATA_CONFIG, 64 * 1024)
+	local out: string
+	if ok and type(text) == "string" then
+		local lines: { string } = {}
+		local replaced = false
+		for raw in string.gmatch((text :: string) .. "\n", "([^\n]*)\n") do
+			local code = strip_comment(raw)
+			if not replaced and string.match(trim(code), "^volume%s*=") then
+				-- Keep a trailing comment and the spacing before it.
+				local comment = string.sub(raw, #code + 1)
+				local gap = if comment ~= "" then string.match(code, "%s*$") or " " else ""
+				table.insert(lines, line .. gap .. comment)
+				replaced = true
+			else
+				table.insert(lines, raw)
+			end
+		end
+		if not replaced then
+			-- A trailing newline leaves an empty last piece: append before it.
+			if lines[#lines] == "" then
+				table.insert(lines, (#lines), line)
+			else
+				table.insert(lines, line)
+			end
+		end
+		out = table.concat(lines, "\n")
+	else
+		out = table.concat({
+			"# Written by Chime: Louder / Softer from the settings in use; edit freely.",
+			"alert = " .. quote(config.sounds.alert or ""),
+			"yield = " .. quote(config.sounds.yield or ""),
+			"done = " .. quote(config.sounds.done or ""),
+			"only_unfocused = " .. tostring(config.only_unfocused),
+			"min_seconds = " .. tostring(config.min_seconds),
+			line,
+			"",
+		}, "\n")
+	end
+	tern.fs.write(DATA_CONFIG, out)
+	config_key = snapshot_key()
+	local problems = load_config()
+	if #problems > 0 then
+		tern.log.warn("Chime: " .. table.concat(problems, "; "))
+	end
+end
+
 -- Mute + cross-window claim -----------------------------------------------------------------
 
 local is_muted = false
@@ -534,27 +590,70 @@ tern.command({
 	end,
 })
 
+-- Plays the yield sound for the test and volume commands, or toasts why not.
+local function play_test(cx: WindowCx): string?
+	local path = config.sounds["yield"]
+	if path == nil or path == "" then
+		cx:toast("error", "Chime", "No yield sound configured")
+		return nil
+	end
+	if config.volume <= 0 then
+		cx:toast("error", "Chime", "volume is 0 in " .. config_source)
+		return nil
+	end
+	local ok_exists, exists = pcall(tern.fs.exists, path)
+	if not ok_exists or not exists then
+		cx:toast("error", "Chime", "Missing: " .. path)
+		return nil
+	end
+	play_file(path)
+	return path
+end
+
 tern.command({
 	id = "test",
 	title = "Chime: Play test sound",
 	icon = "bell",
 	run = function(cx: WindowCx)
-		local path = config.sounds["yield"]
-		if path == nil or path == "" then
-			cx:toast("error", "Chime", "No yield sound configured")
-			return
+		local path = play_test(cx)
+		if path ~= nil then
+			cx:toast("info", "Chime", "Playing " .. path)
 		end
-		if config.volume <= 0 then
-			cx:toast("error", "Chime", "volume is 0 in " .. config_source)
-			return
-		end
-		local ok_exists, exists = pcall(tern.fs.exists, path)
-		if not ok_exists or not exists then
-			cx:toast("error", "Chime", "Missing: " .. path)
-			return
-		end
-		play_file(path)
-		cx:toast("info", "Chime", "Playing " .. path)
+	end,
+})
+
+local VOLUME_STEP = 0.1
+
+-- Steps land on tenths from one step up to 1, and never move the wrong way:
+-- Softer below one step (or from 0, silent) leaves the volume alone.
+local function step_volume(cx: WindowCx, delta: number)
+	local volume = math.clamp(math.floor((config.volume + delta) * 10 + 0.5) / 10, VOLUME_STEP, 1)
+	volume = if delta < 0 then math.min(volume, config.volume) else math.max(volume, config.volume)
+	local ok, err = pcall(save_volume, volume)
+	if not ok then
+		cx:toast("error", "Chime", "Couldn't save the volume: " .. tostring(err))
+		return
+	end
+	if play_test(cx) ~= nil then
+		cx:toast("info", "Chime", "Volume " .. tostring(math.floor(volume * 100 + 0.5)) .. "%")
+	end
+end
+
+tern.command({
+	id = "louder",
+	title = "Chime: Louder",
+	icon = "bell",
+	run = function(cx: WindowCx)
+		step_volume(cx, VOLUME_STEP)
+	end,
+})
+
+tern.command({
+	id = "softer",
+	title = "Chime: Softer",
+	icon = "bell",
+	run = function(cx: WindowCx)
+		step_volume(cx, -VOLUME_STEP)
 	end,
 })
 
