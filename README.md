@@ -17,9 +17,9 @@ For development, `tern plugin link /path/to/tern-chime`.
 
 | OS | Player | Notes |
 |---|---|---|
-| Windows | `Media.SoundPlayer` via a hidden `wscript` launcher | WAV only; no console flash |
+| Windows | `Media.SoundPlayer` via a hidden `wscript` launcher | WAV only; no console flash; no volume control |
 | macOS | `afplay` (ships with the OS) | Plays whatever afplay reads |
-| Linux | `pw-play` → `paplay` → `aplay` → `ffplay` → `play`, first found wins | PipeWire-native first; on a bare server install one of `pipewire-bin`, `pulseaudio-utils`, `alsa-utils`, `ffmpeg` or `sox` |
+| Linux | `pw-play` → `paplay` → `aplay` → `ffplay` → `play`, first found wins | PipeWire-native first; on a bare server install one of `pipewire-bin`, `pulseaudio-utils`, `alsa-utils`, `ffmpeg` or `sox`; `aplay` has no volume control |
 | iOS | — | Silent; sound playback isn't available to plugins |
 
 On Linux without any player, Chime logs one warning and stays silent rather
@@ -33,6 +33,16 @@ reinstall keeps your sounds. In your override, paths can be absolute,
 `~/`-relative, or relative to the plugin data folder (handy for a `sounds/`
 folder next to the config); an empty path silences that trigger. The config
 re-reads every few seconds, and **Chime: Reload sounds** refreshes it at once.
+
+`volume` sets how loud every chime plays, from 0 to 1 as linear amplitude:
+0.5 is about −6 dB and 0.3 about −10 dB. The default 1 plays the files as they
+are, and 0 silences every trigger. Chime converts it for each player
+(`paplay` takes a cubic scale, the others are linear). `aplay` and Windows'
+`Media.SoundPlayer` have no volume option, so they always play at 1 and Chime
+logs one warning. **Chime: Louder** and **Chime: Softer** step it by 0.1 and
+play the test sound at the new level; they write the `volume` line of
+`<plugin data>/sounds.toml`, creating that file from the settings in use when
+it doesn't exist yet.
 
 The bundled chimes in `sounds/` are synthesized in-repo and free to keep, but
 they are just defaults. To use the Mac "Funk" alert sound, for example:
@@ -54,6 +64,7 @@ yield = "sounds/Funk.wav"    # omp agent yielded its turn
 done = ""                     # long commands: silent
 only_unfocused = true         # chime only for panes you aren't looking at
 min_seconds = 30              # commands running this long chime done
+volume = 0.5                  # half amplitude, about -6 dB
 ```
 
 More recipes:
@@ -78,5 +89,7 @@ min_seconds = 120
 ## Palette
 
 **Chime: Mute / unmute** (the status line shows `chime muted` while muted),
-**Chime: Play test sound**, **Chime: Reload sounds**, **Chime: Diagnose panes
-and agents** (writes what Chime sees to `<plugin data>/diagnose.txt`).
+**Chime: Play test sound**, **Chime: Louder** and **Chime: Softer** (see
+Sounds above; bindable as `plugin.chime.louder` and `plugin.chime.softer`),
+**Chime: Reload sounds**, **Chime: Diagnose panes and agents** (writes what
+Chime sees to `<plugin data>/diagnose.txt`).
