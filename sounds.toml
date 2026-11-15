@@ -20,3 +20,8 @@ only_unfocused = true
 # Shell commands running at least this long chime the done sound when they
 # finish. 0 chimes every finished command.
 min_seconds = 30
+
+# Playback volume from 0 to 1, as linear amplitude (0.5 is about -6 dB). 1
+# plays the files as they are; 0 silences every trigger. aplay and Windows
+# have no volume option and always play at 1.
+volume = 1

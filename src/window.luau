@@ -23,6 +23,7 @@ type Config = {
 	sounds: { [string]: string },
 	only_unfocused: boolean,
 	min_seconds: number,
+	volume: number,
 }
 
 local TICK_MS = 250
@@ -99,6 +100,7 @@ local function default_config(): Config
 		},
 		only_unfocused = true,
 		min_seconds = 30,
+		volume = 1,
 	}
 end
 
@@ -154,6 +156,13 @@ local function parse_config(text: string, base: string): (Config, { string })
 					table.insert(proproblems, "min_seconds: expected seconds >= 0, got " .. value)
 				else
 					config.min_seconds = n
+				end
+			elseif key == "volume" then
+				local n = tonumber(value)
+				if n == nil or n < 0 or n > 1 then
+					table.insert(problems, "volume: expected a number from 0 to 1, got " .. value)
+				else
+					config.volume = n
 				end
 			else
 				table.insert(problems, "Unknown key: " .. key)
@@ -266,18 +275,59 @@ local linux_queue: { string } = {}
 -- then PulseAudio, ALSA, then the heavy/general players.
 local LINUX_PLAYERS = { "pw-play", "paplay", "aplay", "ffplay", "play" }
 
-local function linux_argv(player: string, path: string): { string }
+local function volume_arg(volume: number): string
+	return string.format("%.3f", volume)
+end
+
+-- `volume` is linear amplitude from 0 to 1. At 1 every player gets the argv
+-- it had before volume existed. aplay has no volume option.
+local function linux_argv(player: string, path: string, volume: number): { string }
+	local quieter = volume < 1
 	if player == "ffplay" then
+		if quieter then
+			-- ffplay's -volume is linear, 0 to 100.
+			local percent = tostring(math.floor(volume * 100 + 0.5))
+			return { "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", percent, path }
+		end
 		return { "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path }
 	elseif player == "play" then
+		if quieter then
+			return { "play", "-q", "-v", volume_arg(volume), path }
+		end
 		return { "play", "-q", path }
 	elseif player == "aplay" then
 		return { "aplay", "-q", path }
 	elseif player == "paplay" then
+		if quieter then
+			-- PulseAudio cubes this value to get amplitude: 65536 * 0.5 would
+			-- play at 0.125 (-18 dB), so take the cube root first.
+			return { "paplay", "--volume=" .. tostring(math.floor(volume ^ (1 / 3) * 65536 + 0.5)), path }
+		end
 		return { "paplay", path }
 	else
+		if quieter then
+			-- pw-play's --volume is linear.
+			return { "pw-play", "--volume=" .. volume_arg(volume), path }
+		end
 		return { "pw-play", path }
 	end
+end
+
+local warned_full_volume = false
+
+-- Players without a volume option play at full volume; say so once.
+local function warn_full_volume(player: string)
+	if config.volume < 1 and not warned_full_volume then
+		warned_full_volume = true
+		tern.log.warn("Chime: " .. player .. " has no volume control; playing at full volume")
+	end
+end
+
+local function linux_play(player: string, path: string)
+	if player == "aplay" then
+		warn_full_volume("aplay")
+	end
+	spawn(linux_argv(player, path, config.volume), path)
 end
 
 local function probe_linux_player()
@@ -298,7 +348,7 @@ local function probe_linux_player()
 				if result.status == 0 and name ~= nil and name ~= "" then
 					linux_player = name
 					for _, path in linux_queue do
-						spawn(linux_argv(name, path), path)
+						linux_play(name, path)
 					end
 				else
 					linux_probe_failed = true
@@ -325,14 +375,20 @@ local function play_file(path: string)
 	elseif os_name == "windows" then
 		-- Via wscript (a windowless GUI host): spawning hidden PowerShell
 		-- directly still flashes a console box on creation. SoundPlayer
-		-- takes WAV only.
+		-- takes WAV only and has no volume.
+		warn_full_volume("Windows' SoundPlayer")
 		spawn({ "wscript.exe", "//Nologo", tern.plugin.dir .. SEP .. "scripts" .. SEP .. "play.vbs", path }, path)
 	elseif os_name == "macos" then
-		spawn({ "afplay", path }, path)
+		if config.volume < 1 then
+			-- afplay's -v is linear.
+			spawn({ "afplay", "-v", volume_arg(config.volume), path }, path)
+		else
+			spawn({ "afplay", path }, path)
+		end
 	elseif os_name == "linux" then
 		local player = linux_player
 		if player ~= nil then
-			spawn(linux_argv(player, path), path)
+			linux_play(player, path)
 		elseif not linux_probe_failed then
 			table.insert(linux_queue, path)
 			probe_linux_player()
@@ -349,7 +405,7 @@ local last_chime_at = -math.huge
 
 local function chime(kind: string, _pane: number)
 	local path = config.sounds[kind]
-	if path == nil or path == "" or is_muted then
+	if path == nil or path == "" or is_muted or config.volume <= 0 then
 		return
 	end
 	local ok_exists, exists = pcall(tern.fs.exists, path)
@@ -488,6 +544,10 @@ tern.command({
 			cx:toast("error", "Chime", "No yield sound configured")
 			return
 		end
+		if config.volume <= 0 then
+			cx:toast("error", "Chime", "volume is 0 in " .. config_source)
+			return
+		end
 		local ok_exists, exists = pcall(tern.fs.exists, path)
 		if not ok_exists or not exists then
 			cx:toast("error", "Chime", "Missing: " .. path)
@@ -523,6 +583,7 @@ tern.command({
 		table.insert(lines, "muted: " .. tostring(is_muted))
 		table.insert(lines, "only_unfocused: " .. tostring(config.only_unfocused))
 		table.insert(lines, "min_seconds: " .. tostring(config.min_seconds))
+		table.insert(lines, "volume: " .. tostring(config.volume))
 		for _, kind in { "alert", "yield", "done" } do
 			local path = config.sounds[kind]
 			local mark = "(off)"
